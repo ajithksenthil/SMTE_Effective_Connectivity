@@ -11,6 +11,7 @@ scikit-learn
 # Network analysis and visualization
 networkx
 matplotlib
+seaborn
 
 # Type checking (optional but recommended)
 typing-extensions
