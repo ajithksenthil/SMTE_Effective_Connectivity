@@ -1,0 +1,21 @@
+# Core numerical and scientific computing
+numpy
+scipy
+
+# Neuroimaging tools
+nibabel
+
+# Machine learning tools
+scikit-learn
+
+# Network analysis and visualization
+networkx
+matplotlib
+
+# Type checking (optional but recommended)
+typing-extensions
+
+# Development tools (optional)
+pytest  # For testing
+black  # For code formatting
+mypy  # For type checking
