@@ -1,0 +1,8 @@
+Implementation,Class,Mean Performance Improvement,Mean Speedup,Success Rate,Regression Checks Passed,Total Evaluation Time (s)
+baseline,VoxelSMTEConnectivity,0.00%,1.00x,4/4,True,0.8
+adaptive,AdaptiveSMTE,0.00%,1.00x,4/4,True,0.8
+network_aware,NetworkAwareSMTE,0.00%,1.00x,4/4,True,0.8
+physiological,PhysiologicalSMTE,0.00%,1.01x,4/4,True,0.8
+multiscale,MultiScaleSMTE,0.00%,1.00x,4/4,True,0.8
+ensemble,EnsembleSMTE,0.00%,1.01x,4/4,True,0.8
+hierarchical,HierarchicalSMTE,0.00%,1.01x,4/4,True,0.8
