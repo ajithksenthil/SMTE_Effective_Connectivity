@@ -1,629 +1,362 @@
+import os
+import math
+import warnings
+from typing import List, Optional, Tuple, Dict, Any
+
 import numpy as np
 import networkx as nx
-import matplotlib.pyplot as plt
-from scipy.stats import entropy
+import nibabel as nib
 from sklearn.preprocessing import KBinsDiscretizer
-import warnings
-from typing import Tuple, List, Optional, Dict
-import seaborn as sns
-# Suppress warnings for clean output
-warnings.filterwarnings('ignore')
+from sklearn.cluster import KMeans
+from numba import njit, prange
 
-class SMTEAnalyzer:
-    """
-    Symbolic Matrix Transfer Entropy (SMTE) analyzer for fMRI data.
-    
-    This class implements SMTE analysis for fMRI time series data, including
-    synthetic data generation for validation and visualization tools.
-    """
-    
-    def __init__(self, 
-                 num_symbols: int = 5, 
-                 noise_scale: float = 0.1,
-                 min_threshold: float = 0.1):
-        """
-        Initialize the enhanced SMTE analyzer.
-        
-        Args:
-            num_symbols (int): Number of symbols for discretization
-            noise_scale (float): Scale of noise in synthetic data
-            min_threshold (float): Minimum threshold for SMTE values
-        """
-        self.num_symbols = num_symbols
-        self.noise_scale = noise_scale
-        self.min_threshold = min_threshold
-        
-    def load_fmri_data(self, 
-                       nifti_file_path: str, 
-                       mask_file_path: Optional[str] = None) -> np.ndarray:
-        """
-        Load fMRI data from a NIfTI file and optionally apply a mask.
-        
-        Args:
-            nifti_file_path (str): Path to the fMRI NIfTI file
-            mask_file_path (str, optional): Path to the mask NIfTI file
-            
-        Returns:
-            np.ndarray: Time series data with shape (num_voxels, num_timepoints)
-        """
-        # Load fMRI data
-        fmri_img = nib.load(nifti_file_path)
-        fmri_data = fmri_img.get_fdata()
-        
-        # Apply mask if provided
-        if mask_file_path and os.path.exists(mask_file_path):
-            mask_img = nib.load(mask_file_path)
-            mask_data = mask_img.get_fdata().astype(bool)
-            time_series_data = fmri_data[mask_data]
+###############################################################################
+# Research‑grade Symbolic Matrix Transfer Entropy (SMTE) toolbox
+# Canvas version – bug‑fixed (non‑negative SMTE) – 2025‑04‑30
+###############################################################################
+
+__all__ = ["SMTE"]
+
+###############################################################################
+# Benjamini–Hochberg FDR helper
+###############################################################################
+
+def fdr_bh(pvals: np.ndarray, q: float = 0.05) -> np.ndarray:
+    """Return boolean mask of p‑values that survive BH‑FDR."""
+    flat = pvals.flatten()
+    m = flat.size
+    idx = np.argsort(flat)
+    thr = q * (np.arange(1, m + 1) / m)
+    passed = np.zeros_like(flat, dtype=bool)
+    passed[idx] = flat[idx] <= thr
+    return passed.reshape(pvals.shape)
+
+###############################################################################
+# Symbolisation functions
+###############################################################################
+
+@njit
+def _ordinal_pattern_index(window: np.ndarray) -> int:
+    """Lehmer code (ordinal pattern index) for a 1‑d window."""
+    rank = window.argsort()
+    code = 0
+    fact = 1
+    for i in range(len(rank) - 1, -1, -1):
+        code += rank[i] * fact
+        fact *= (len(rank) - i)
+    return code
+
+
+def ordinal_symbols(ts: np.ndarray, order: int = 3) -> np.ndarray:
+    if len(ts) < order:
+        raise ValueError("time‑series shorter than ordinal order")
+    N = len(ts) - order + 1
+    symbols = np.empty(N, dtype=np.int64)
+    for i in range(N):
+        symbols[i] = _ordinal_pattern_index(ts[i : i + order])
+    return symbols
+
+
+def vq_symbols(ts: np.ndarray, n_symbols: int) -> np.ndarray:
+    labs = KMeans(n_clusters=n_symbols, n_init="auto", random_state=0).fit_predict(
+        ts.reshape(-1, 1)
+    )
+    return labs.astype(np.int64)
+
+
+def discretise_symbols(
+    ts: np.ndarray, n_symbols: int, strategy: str = "uniform"
+) -> np.ndarray:
+    est = KBinsDiscretizer(n_bins=n_symbols, encode="ordinal", strategy=strategy)
+    return est.fit_transform(ts.reshape(-1, 1)).astype(np.int64).ravel()
+
+###############################################################################
+# Main SMTE class
+###############################################################################
+
+
+class SMTE:
+    """Symbolic Matrix Transfer Entropy analysis for fMRI or generic data."""
+
+    def __init__(
+        self,
+        n_symbols: int = 5,
+        TR: float = 2.0,
+        symboliser: str = "uniform",
+        alpha: float = 0.05,
+        max_lag: Optional[int] = None,
+    ):
+        self.n_symbols = n_symbols
+        self.TR = TR
+        self.symboliser = symboliser  # 'uniform', 'quantile', 'ordinal', 'vq'
+        self.alpha = alpha
+        self.max_lag = max_lag or 6  # default ≈12 s for TR=2
+
+    # ------------------------------------------------------------------
+    # Symbolisation dispatcher
+    # ------------------------------------------------------------------
+    def symbolise(self, ts: np.ndarray) -> np.ndarray:
+        if self.symboliser == "ordinal":
+            return ordinal_symbols(ts, order=3)
+        elif self.symboliser == "vq":
+            return vq_symbols(ts, self.n_symbols)
         else:
-            # Reshape to 2D array (voxels × time points)
-            time_series_data = fmri_data.reshape(-1, fmri_data.shape[-1])
-            
-        # Standardize the time series
-        time_series_data = self._standardize_time_series(time_series_data)
-        
-        return time_series_data
-    
-    def _standardize_time_series(self, data: np.ndarray) -> np.ndarray:
-        """
-        Improved time series standardization.
-        """
-        mean = np.mean(data, axis=1, keepdims=True)
-        std = np.std(data, axis=1, keepdims=True)
-        
-        # Handle zero standard deviation with small constant
-        std[std < 1e-10] = 1e-10
-        
-        return (data - mean) / std
-    
-    def symbolize_time_series(self, time_series: np.ndarray) -> np.ndarray:
-        """
-        Enhanced symbolization using adaptive binning.
-        """
-        # Add noise to break ties
-        noise = np.random.normal(0, 1e-10, time_series.shape)
-        time_series = time_series + noise
-        
-        # Use uniform strategy for more robust symbolization
-        est = KBinsDiscretizer(
-            n_bins=self.num_symbols,
-            encode='ordinal',
-            strategy='uniform'  # Changed from 'quantile' for better handling of outliers
-        )
-        
-        symbols = est.fit_transform(
-            time_series.reshape(-1, 1)
-        ).astype(int).flatten()
-        
-        return symbols
-    
-    def compute_gram_matrix(self, symbols: np.ndarray) -> np.ndarray:
-        """
-        Improved Gram matrix computation with regularization.
-        """
-        N = len(symbols)
-        gram_matrix = np.equal.outer(symbols, symbols).astype(float)
-        
-        # Add small regularization term
-        epsilon = 1e-10
-        gram_matrix += epsilon
-        
-        # Normalize
-        gram_matrix /= (N + epsilon)
-        
-        return gram_matrix
-    
-    def _compute_kl_divergence(self, 
-                             smte_matrix: np.ndarray, 
-                             ground_truth: np.ndarray) -> float:
-        """
-        Compute KL divergence with proper normalization and smoothing.
-        """
-        epsilon = 1e-10
-        smte_prob = smte_matrix + epsilon
-        ground_prob = ground_truth + epsilon
-        
-        # Normalize to probability distributions
-        smte_prob = smte_prob / np.sum(smte_prob)
-        ground_prob = ground_prob / np.sum(ground_prob)
-        
-        return entropy(ground_prob.flatten(), smte_prob.flatten())
+            return discretise_symbols(ts, self.n_symbols, strategy=self.symboliser)
 
-    def compute_joint_gram_matrix(self, 
-                                symbols_x: np.ndarray, 
-                                symbols_y: np.ndarray,
-                                lag: int = 1) -> np.ndarray:
-        """
-        Enhanced joint Gram matrix computation with lag consideration.
-        """
-        if lag > 0:
-            symbols_x = symbols_x[lag:]
-            symbols_y = symbols_y[:-lag]
-        
-        N = len(symbols_x)
-        joint_matrix = (np.equal.outer(symbols_x, symbols_x) * 
-                       np.equal.outer(symbols_y, symbols_y))
-        
-        # Add regularization
-        epsilon = 1e-10
-        joint_matrix = joint_matrix.astype(float) + epsilon
-        joint_matrix /= (N + epsilon)
-        
-        return joint_matrix
-    
-    def matrix_entropy(self, gram_matrix: np.ndarray) -> float:
-        """
-        Improved matrix entropy computation with better numerical stability.
-        """
-        # Add small constant for numerical stability
-        epsilon = 1e-10
-        gram_matrix = gram_matrix + epsilon
-        
-        # Normalize to ensure proper probability interpretation
-        gram_matrix = gram_matrix / np.sum(gram_matrix)
-        
-        # Compute eigenvalues
-        eigenvals = np.linalg.eigvalsh(gram_matrix)
-        eigenvals = eigenvals[eigenvals > epsilon]
-        
-        # Compute entropy using eigenvalues
-        return -np.sum(eigenvals * np.log(eigenvals))
-    
-    def compute_smte(self, 
-                    symbols_x: np.ndarray, 
-                    symbols_y: np.ndarray,
-                    max_lag: int = 3) -> Tuple[float, int]:
-        """
-        Enhanced SMTE computation with lag optimization.
-        """
-        best_smte = -np.inf
-        best_lag = 0
-        
-        for lag in range(max_lag + 1):
-            # Compute Gram matrices
-            gram_x = self.compute_gram_matrix(symbols_x)
-            gram_y = self.compute_gram_matrix(symbols_y)
-            gram_joint = self.compute_joint_gram_matrix(symbols_x, symbols_y, lag)
-            
-            # Compute entropies with improved numerical stability
-            S_x = self.matrix_entropy(gram_x)
-            S_y = self.matrix_entropy(gram_y)
-            S_joint = self.matrix_entropy(gram_joint)
-            
-            # Compute conditional entropy
-            S_x_given_y = S_joint - S_y
-            
-            # Compute SMTE
-            smte = S_x_given_y - S_x
-            
-            # Normalize by maximum possible entropy
-            max_entropy = np.log(len(symbols_x))
-            smte = smte / max_entropy
-            
-            if smte > best_smte:
-                best_smte = smte
-                best_lag = lag
-        
-        return best_smte, best_lag
-    
-    def compute_smte_matrix(self, 
-                          time_series_data: np.ndarray,
-                          max_lag: int = 3) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Enhanced SMTE matrix computation with lag information.
-        """
-        num_series = time_series_data.shape[0]
-        smte_matrix = np.zeros((num_series, num_series))
-        lag_matrix = np.zeros((num_series, num_series), dtype=int)
-        
-        # Convert all time series to symbols first
-        symbolic_series = np.array([
-            self.symbolize_time_series(ts) for ts in time_series_data
-        ])
-        
-        # Compute SMTE for all pairs
-        for i in range(num_series):
-            for j in range(num_series):
-                if i != j:
-                    smte, lag = self.compute_smte(
-                        symbolic_series[i], 
-                        symbolic_series[j],
-                        max_lag
-                    )
-                    smte_matrix[i, j] = smte
-                    lag_matrix[i, j] = lag
-        
-        return smte_matrix, lag_matrix
-    
+    # ------------------------------------------------------------------
+    # Gram matrix (Numba‑accelerated)
+    # ------------------------------------------------------------------
+    @staticmethod
+    @njit(parallel=True)
+    def _gram(symbols: np.ndarray) -> np.ndarray:
+        N = symbols.size
+        G = np.empty((N, N), dtype=np.float64)
+        for i in prange(N):
+            for j in range(N):
+                G[i, j] = 1.0 if symbols[i] == symbols[j] else 0.0
+        eps = 1e-10
+        G_norm = G + eps
+        return G_norm / np.sum(G_norm)
 
-    
-    def build_directed_graph(self, 
-                           smte_matrix: np.ndarray,
-                           lag_matrix: np.ndarray,
-                           threshold_percentile: float = 95) -> nx.DiGraph:
-        """
-        Enhanced graph construction with adaptive thresholding.
-        """
-        # Compute adaptive thresholds for each node
-        thresholds = np.array([
-            np.percentile(row[row > self.min_threshold], threshold_percentile)
-            if np.any(row > self.min_threshold) else self.min_threshold
-            for row in smte_matrix
-        ])
-        
-        # Create adjacency matrix
-        adjacency_matrix = np.zeros_like(smte_matrix)
-        for i in range(len(smte_matrix)):
-            # Consider both SMTE value and relative difference
-            for j in range(len(smte_matrix)):
-                if i != j:
-                    if smte_matrix[i, j] >= thresholds[i]:
-                        # Check if the reverse connection is weaker
-                        if smte_matrix[i, j] > smte_matrix[j, i]:
-                            adjacency_matrix[i, j] = 1
-        
-        # Create directed graph
-        G = nx.from_numpy_array(adjacency_matrix, create_using=nx.DiGraph)
-        
-        # Add edge attributes
-        for i, j in G.edges():
-            G[i][j]['weight'] = smte_matrix[i, j]
-            G[i][j]['lag'] = lag_matrix[i, j]
-        
-        return G
-    
-    def plot_smte_matrix(self, 
-                        smte_matrix: np.ndarray, 
-                        title: str = "SMTE Matrix"):
-        """
-        Plot the SMTE matrix.
-        
-        Args:
-            smte_matrix (np.ndarray): SMTE matrix to plot
-            title (str): Plot title
-        """
-        plt.figure(figsize=(10, 8))
-        plt.imshow(smte_matrix, cmap='hot', interpolation='nearest')
-        plt.colorbar(label='SMTE Value')
-        plt.title(title)
-        plt.xlabel('Source Time Series')
-        plt.ylabel('Target Time Series')
-        plt.show()
-        
-    def plot_directed_graph(self, G: nx.DiGraph):
-        """
-        Plot the directed graph.
-        
-        Args:
-            G (nx.DiGraph): NetworkX directed graph
-        """
-        plt.figure(figsize=(12, 8))
-        pos = nx.spring_layout(G, k=1, iterations=50)
-        
-        # Draw nodes
-        nx.draw_networkx_nodes(G, pos, node_size=500, node_color='lightblue')
-        
-        # Draw edges with weights determining color
-        edges = G.edges()
-        weights = [G[u][v]['weight'] for u, v in edges]
-        
-        nx.draw_networkx_edges(
-            G, pos, 
-            edgelist=edges,
-            edge_color=weights,
-            edge_cmap=plt.cm.viridis,
-            width=2,
-            arrowsize=20
-        )
-        
-        plt.title('SMTE Directed Graph Network')
-        plt.axis('off')
-        plt.show()
+    # ------------------------------------------------------------------
+    # Truncation helper
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _truncate(x: np.ndarray, y: np.ndarray, lag: int):
+        if lag == 0:
+            return x[1:], x[:-1], y[:-1]
+        return x[lag:], x[:-lag], y[:-lag]
 
-    def generate_synthetic_data(self, 
-                              num_timepoints: int, 
-                              num_series: int,
-                              dependency_config: Optional[List[dict]] = None) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Enhanced synthetic data generation with improved dependencies.
-        """
-        np.random.seed(42)
-        
-        # Initialize data with scaled noise
-        data = np.random.randn(num_series, num_timepoints) * self.noise_scale
-        
-        # Initialize ground truth matrix
-        ground_truth = np.zeros((num_series, num_series))
-        
-        if dependency_config is None:
-            dependency_config = [
-                {
-                    'source': i-1,
-                    'target': i,
-                    'strength': 0.5,
-                    'lag': 1
-                }
-                for i in range(1, num_series)
-            ]
-        
-        # Apply dependencies with nonlinear components
-        for dep in dependency_config:
-            source = dep['source']
-            target = dep['target']
-            strength = dep['strength']
-            lag = dep.get('lag', 1)
-            
-            if source >= 0 and target < num_series:
-                # Add both linear and nonlinear dependencies
-                source_signal = data[source, :-lag]
-                nonlinear_component = 0.3 * source_signal**2
-                data[target, lag:] += strength * (source_signal + nonlinear_component)
-                
-                # Add some cross-frequency coupling
-                if len(source_signal) > 20:
-                    omega = 2 * np.pi / 20
-                    modulation = 0.2 * strength * np.sin(omega * np.arange(len(source_signal)))
-                    data[target, lag:] += modulation * source_signal
-                
-                # Record in ground truth matrix
-                ground_truth[target, source] = strength
-        
-        # Add some temporal structure
-        for i in range(num_series):
-            data[i] = np.convolve(data[i], np.exp(-np.arange(10)/3), mode='same')
-        
-        # Standardize the time series
-        data = self._standardize_time_series(data)
-        
-        return data, ground_truth
-    
-    def _compute_basic_metrics(self, 
-                             smte_matrix: np.ndarray,
-                             ground_truth: np.ndarray,
-                             threshold_percentile: float = 95) -> dict:
-        """
-        Compute basic evaluation metrics with fixed broadcasting.
-        
-        Args:
-            smte_matrix (np.ndarray): Computed SMTE matrix
-            ground_truth (np.ndarray): Ground truth dependency matrix
-            threshold_percentile (float): Percentile for thresholding
-            
-        Returns:
-            dict: Dictionary containing evaluation metrics
-        """
-        # Create binary matrices
-        binary_ground_truth = (ground_truth > 0).astype(int)
-        
-        # Threshold SMTE matrix using row-wise adaptive thresholding
-        predicted = np.zeros_like(smte_matrix)
-        for i in range(smte_matrix.shape[0]):
-            row = smte_matrix[i]
-            nonzero_values = row[row != 0]
-            if len(nonzero_values) > 0:
-                threshold = np.percentile(nonzero_values, threshold_percentile)
-            else:
-                threshold = 0
-            predicted[i] = (row >= threshold).astype(int)
-        
-        # Calculate metrics
-        true_pos = np.sum((predicted == 1) & (binary_ground_truth == 1))
-        false_pos = np.sum((predicted == 1) & (binary_ground_truth == 0))
-        true_neg = np.sum((predicted == 0) & (binary_ground_truth == 0))
-        false_neg = np.sum((predicted == 0) & (binary_ground_truth == 1))
-        
-        precision = true_pos / (true_pos + false_pos) if (true_pos + false_pos) > 0 else 0
-        recall = true_pos / (true_pos + false_neg) if (true_pos + false_neg) > 0 else 0
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-        accuracy = (true_pos + true_neg) / np.prod(smte_matrix.shape)
-        
-        # Direction accuracy
-        direction_correct = 0
-        direction_total = 0
-        direction_confidence = []
-        
-        for i in range(len(smte_matrix)):
-            for j in range(len(smte_matrix)):
-                if ground_truth[i,j] > 0 or ground_truth[j,i] > 0:
-                    direction_total += 1
-                    if ground_truth[i,j] > ground_truth[j,i]:
-                        if smte_matrix[i,j] > smte_matrix[j,i]:
-                            direction_correct += 1
-                            direction_confidence.append(smte_matrix[i,j] - smte_matrix[j,i])
-                    elif ground_truth[j,i] > ground_truth[i,j]:
-                        if smte_matrix[j,i] > smte_matrix[i,j]:
-                            direction_correct += 1
-                            direction_confidence.append(smte_matrix[j,i] - smte_matrix[i,j])
-        
-        direction_accuracy = direction_correct / direction_total if direction_total > 0 else 0
-        avg_direction_confidence = np.mean(direction_confidence) if direction_confidence else 0
-        
-        # Compute strength correlation for non-zero entries
-        mask = (ground_truth != 0)
-        if np.sum(mask) > 1:
-            strength_correlation = np.corrcoef(
-                smte_matrix[mask],
-                ground_truth[mask]
-            )[0,1]
-        else:
-            strength_correlation = 0
-        
-        return {
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'direction_accuracy': direction_accuracy,
-            'direction_confidence': avg_direction_confidence,
-            'strength_correlation': strength_correlation,
-            'confusion_matrix': {
-                'true_positives': int(true_pos),
-                'false_positives': int(false_pos),
-                'true_negatives': int(true_neg),
-                'false_negatives': int(false_neg)
-            }
-        }
+    # ------------------------------------------------------------------
+    # Von‑Neumann entropy (α = 2) – guaranteed non‑negative
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _S(G: np.ndarray) -> float:
+        eps = 1e-10
+        G_norm = G / np.sum(G)  # proper probability normalization
+        eig = np.linalg.eigvalsh(G_norm)
+        eig = np.clip(eig, eps, 1.0)  # avoid tiny negatives
+        S = -np.sum(eig * np.log(eig))
+        return max(S, 0.0)
 
-    def evaluate_smte_performance(self, 
-                                smte_matrix: np.ndarray,
-                                ground_truth: np.ndarray,
-                                lag_matrix: Optional[np.ndarray] = None,
-                                threshold_percentile: float = 95) -> dict:
-        """
-        Enhanced performance evaluation with fixed broadcasting.
-        
-        Args:
-            smte_matrix (np.ndarray): Computed SMTE matrix
-            ground_truth (np.ndarray): Ground truth dependency matrix
-            lag_matrix (np.ndarray, optional): Matrix of detected lags
-            threshold_percentile (float): Percentile for thresholding
+    # ------------------------------------------------------------------
+    # Pairwise SMTE
+    # ------------------------------------------------------------------
+    def smte(self, x: np.ndarray, y: np.ndarray) -> Tuple[float, int]:
+        best, best_lag = -np.inf, 0
+        for lag in range(self.max_lag + 1):
+            x_now, x_past, y_past = self._truncate(x, y, lag)
             
-        Returns:
-            dict: Evaluation metrics with confidence intervals
-        """
-        # Compute basic metrics
-        metrics = self._compute_basic_metrics(
-            smte_matrix, 
-            ground_truth, 
-            threshold_percentile
-        )
-        
-        # Compute lag accuracy if lag_matrix is provided
-        if lag_matrix is not None:
-            lag_accuracy = 0
-            total_deps = 0
+            # Use histogram-based joint entropy for computational efficiency
+            n_bins = min(self.n_symbols, len(np.unique(x_now)))
             
-            for i in range(len(ground_truth)):
-                for j in range(len(ground_truth)):
-                    if ground_truth[i,j] > 0:
-                        total_deps += 1
-                        # Check if detected lag matches configuration
-                        # Note: This assumes lag information is available in ground truth
-                        if lag_matrix[i,j] > 0:  # If a lag was detected
-                            lag_accuracy += 1
+            # Joint histogram H(X_t, X_{t-1})
+            hist_x_xpast, _ = np.histogramdd([x_now, x_past], bins=n_bins)
+            hist_x_xpast = hist_x_xpast + 1e-10  # regularization
+            prob_x_xpast = hist_x_xpast / np.sum(hist_x_xpast)
+            H_x_xpast = -np.sum(prob_x_xpast * np.log(prob_x_xpast + 1e-10))
             
-            metrics['lag_accuracy'] = lag_accuracy / total_deps if total_deps > 0 else 0
-        
-        # Add normalized metrics
-        metrics['normalized_smte'] = np.mean(smte_matrix[ground_truth > 0]) if np.any(ground_truth > 0) else 0
-        
-        # Compute confidence scores
-        confidence_scores = []
-        for i in range(len(smte_matrix)):
-            for j in range(len(smte_matrix)):
-                if ground_truth[i,j] > 0:
-                    confidence_scores.append(smte_matrix[i,j])
-        
-        if confidence_scores:
-            metrics['mean_confidence'] = np.mean(confidence_scores)
-            metrics['confidence_std'] = np.std(confidence_scores)
-        else:
-            metrics['mean_confidence'] = 0
-            metrics['confidence_std'] = 0
+            # Joint histogram H(X_t, X_{t-1}, Y_{t-1})
+            hist_x_xpast_ypast, _ = np.histogramdd([x_now, x_past, y_past], bins=n_bins)
+            hist_x_xpast_ypast = hist_x_xpast_ypast + 1e-10
+            prob_x_xpast_ypast = hist_x_xpast_ypast / np.sum(hist_x_xpast_ypast)
+            H_x_xpast_ypast = -np.sum(prob_x_xpast_ypast * np.log(prob_x_xpast_ypast + 1e-10))
             
-        return metrics
+            # Individual histograms
+            hist_xpast, _ = np.histogram(x_past, bins=n_bins)
+            hist_xpast = hist_xpast + 1e-10
+            prob_xpast = hist_xpast / np.sum(hist_xpast)
+            H_xpast = -np.sum(prob_xpast * np.log(prob_xpast + 1e-10))
+            
+            hist_xpast_ypast, _ = np.histogramdd([x_past, y_past], bins=n_bins)
+            hist_xpast_ypast = hist_xpast_ypast + 1e-10
+            prob_xpast_ypast = hist_xpast_ypast / np.sum(hist_xpast_ypast)
+            H_xpast_ypast = -np.sum(prob_xpast_ypast * np.log(prob_xpast_ypast + 1e-10))
+            
+            # Transfer entropy: TE = H(X_t|X_{t-1}) - H(X_t|X_{t-1}, Y_{t-1})
+            val = H_x_xpast - H_xpast - H_x_xpast_ypast + H_xpast_ypast
+            val = max(val, 0.0)  # enforce theoretical ≥0
+            
+            if val > best:
+                best, best_lag = val, lag
+        return best, best_lag
 
+    # ------------------------------------------------------------------
+    # Surrogate test (circular shift)
+    # ------------------------------------------------------------------
+    def smte_surrogate_p(
+        self, x: np.ndarray, y: np.ndarray, n_surr: int = 500
+    ) -> Tuple[float, float]:
+        orig, _ = self.smte(x, y)
+        null = np.empty(n_surr)
+        for k in range(n_surr):
+            shift = np.random.randint(1, len(y) - 1)
+            null[k], _ = self.smte(x, np.roll(y, shift))
+        p = (np.sum(null >= orig) + 1) / (n_surr + 1)
+        return orig, p
 
-    def plot_evaluation_results(self, evaluation_metrics: dict):
-        """
-        Enhanced plotting of evaluation metrics.
-        """
-        plt.figure(figsize=(15, 10))
-        
-        # Basic metrics with confidence intervals
-        plt.subplot(2, 2, 1)
-        metrics = ['accuracy', 'precision', 'recall', 'f1', 'direction_accuracy']
-        values = [evaluation_metrics[m] for m in metrics]
-        confidence_intervals = [
-            evaluation_metrics['confidence_intervals'].get(m, [0, 0]) 
-            for m in metrics
+    # ------------------------------------------------------------------
+    # Full SMTE network with BH‑FDR + diagnostics
+    # ------------------------------------------------------------------
+    def smte_network(self, data: np.ndarray):
+        n_roi = data.shape[0]
+        symbols = [self.symbolise(ts) for ts in data]
+
+        S = np.zeros((n_roi, n_roi))
+        P = np.ones((n_roi, n_roi))
+        L = np.zeros((n_roi, n_roi), dtype=int)
+
+        for i in range(n_roi):
+            for j in range(n_roi):
+                if i == j:
+                    continue
+                smte_val, p_val = self.smte_surrogate_p(symbols[i], symbols[j])
+                S[i, j] = smte_val
+                P[i, j] = p_val
+                _, L[i, j] = self.smte(symbols[i], symbols[j])
+
+        # Diagnostics
+        print("Smallest raw p‑value:", P.min())
+
+        mask = fdr_bh(P, q=self.alpha)
+        print("Significant edges (BH‑FDR):")
+        edges = [
+            (i, j, S[i, j], P[i, j]) for i in range(n_roi) for j in range(n_roi) if mask[i, j]
         ]
-        
-        x = range(len(metrics))
-        plt.bar(x, values)
-        plt.errorbar(x, values, 
-                    yerr=[[v - ci[0] for v, ci in zip(values, confidence_intervals)],
-                          [ci[1] - v for v, ci in zip(values, confidence_intervals)]],
-                    fmt='none', color='black', capsize=5)
-        
-        plt.xticks(x, metrics, rotation=45)
-        plt.title('Performance Metrics with 95% CI')
-        plt.ylim(0, 1)
-        
-        # Continue with other plots as in original implementation
-        
-        plt.tight_layout()
-        plt.show()
+        if not edges:
+            print("  None survived q=", self.alpha)
+        else:
+            for i, j, s, p in sorted(edges, key=lambda t: t[3]):
+                print(f"  {i} → {j} | SMTE={s:.3f} | p={p:.4g}")
 
-def run_validation_example():
-    """
-    Run a validation example using synthetic data with comprehensive evaluation.
-    """
-    # Initialize analyzer
-    analyzer = SMTEAnalyzer(num_symbols=5)
-    
-    # Create custom dependency configuration
-    dependency_config = [
-        {'source': 0, 'target': 1, 'strength': 0.5, 'lag': 1},
-        {'source': 1, 'target': 2, 'strength': 0.7, 'lag': 1},
-        {'source': 0, 'target': 3, 'strength': 0.3, 'lag': 2},
-        {'source': 2, 'target': 4, 'strength': 0.6, 'lag': 1}
-    ]
-    
-    # Generate synthetic data with known dependencies
-    print("Generating synthetic data...")
-    synthetic_data, ground_truth = analyzer.generate_synthetic_data(
-        num_timepoints=200,
-        num_series=5,
-        dependency_config=dependency_config
-    )
-    
-    print("\nGround Truth Dependency Matrix:")
-    print(ground_truth)
-    
-    # Compute SMTE matrix
-    print("\nComputing SMTE matrix...")
-    smte_matrix = analyzer.compute_smte_matrix(synthetic_data)
-    
-    # Evaluate SMTE performance
-    print("\nEvaluating SMTE performance...")
-    evaluation_metrics = analyzer.evaluate_smte_performance(
-        smte_matrix,
-        ground_truth
-    )
-    
-    # Print evaluation results
-    print("\nEvaluation Results:")
-    print("-" * 50)
-    for metric, value in evaluation_metrics.items():
-        if metric != 'confusion_matrix':
-            print(f"{metric}: {value:.3f}")
-    
-    # Plot results
-    analyzer.plot_evaluation_results(evaluation_metrics)
-    
-    # Compare ground truth and SMTE matrices
-    plt.figure(figsize=(15, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.imshow(ground_truth, cmap='hot', interpolation='nearest')
-    plt.colorbar(label='Dependency Strength')
-    plt.title('Ground Truth Dependencies')
-    plt.xlabel('Source')
-    plt.ylabel('Target')
-    
-    plt.subplot(1, 2, 2)
-    plt.imshow(smte_matrix, cmap='hot', interpolation='nearest')
-    plt.colorbar(label='SMTE Value')
-    plt.title('Computed SMTE Matrix')
-    plt.xlabel('Source')
-    plt.ylabel('Target')
-    
-    plt.tight_layout()
-    plt.show()
-    
-    return smte_matrix, ground_truth, evaluation_metrics
+        return S, P, L
+
+
+###############################################################################
+# Quick synthetic demo when run as script
+###############################################################################
 
 if __name__ == "__main__":
-    # Run validation example with evaluation
-    smte_matrix, ground_truth, evaluation_metrics = run_validation_example()
+    np.random.seed(0)
+    n_roi, T = 5, 300
+    data = np.random.randn(n_roi, T)
+    # Inject simple 0 → 1 causal link (lag 1)
+    data[1, 1:] += 0.6 * data[0, :-1]
+
+    smte = SMTE(n_symbols=5, symboliser="ordinal", alpha=0.1)
+    S, P, L = smte.smte_network(data)
+###############################################################################
+# Synthetic data utilities & validation
+###############################################################################
+
+from scipy.signal import fftconvolve
+from sklearn.metrics import (
+    confusion_matrix,
+    accuracy_score,
+    precision_recall_fscore_support,
+    roc_auc_score,
+)
+
+DEFAULT_HRF = np.exp(-np.arange(0, 30) / 4.0)  # simple exponential HRF
+
+
+def _apply_hrf(ts: np.ndarray, hrf: np.ndarray) -> np.ndarray:
+    """Convolve each ROI with an HRF in the *forward* direction."""
+    out = np.zeros_like(ts)
+    for i in range(ts.shape[0]):
+        out[i] = fftconvolve(ts[i], hrf, mode="same")
+    return out
+
+
+def generate_synthetic_data(
+    n_roi: int,
+    n_time: int,
+    causal_spec: List[Tuple[int, int, int, float]],
+    snr_db: float = 0.0,
+    hrf: Optional[np.ndarray] = None,
+    seed: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Create synthetic multivariate time‑series with known causal links.
+
+    Parameters
+    ----------
+    n_roi, n_time : int
+        Number of regions and time‑points.
+    causal_spec : list of tuples
+        Each tuple = (source, target, lag, strength).  `strength` is *post‑noise*.
+    snr_db : float
+        Desired signal‑to‑noise ratio in decibels. 0 dB ==> signal power == noise power.
+    hrf : ndarray | None
+        If provided, each ROI is convolved with this HRF to emulate BOLD.
+    """
+    rng = np.random.default_rng(seed)
+    base_noise = rng.standard_normal((n_roi, n_time))
+
+    signal = np.zeros_like(base_noise)
+    for src, tgt, lag, g in causal_spec:
+        if lag >= n_time:
+            raise ValueError("lag longer than time‑series")
+        signal[tgt, lag:] += g * base_noise[src, :-lag]
+
+    # scale noise to achieve requested SNR
+    sig_pow = np.var(signal)
+    if sig_pow == 0:
+        sig_pow = 1e-12
+    noise_pow_target = sig_pow / (10 ** (snr_db / 10))
+    noise_scale = math.sqrt(noise_pow_target)
+    data = signal + noise_scale * base_noise
+
+    if hrf is not None:
+        data = _apply_hrf(data, hrf)
+
+    # ground‑truth adjacency (directed)
+    gt = np.zeros((n_roi, n_roi))
+    for src, tgt, _, g in causal_spec:
+        gt[tgt, src] = g
+    return data, gt
+
+
+# -------------------------------------------------------------------------
+# Evaluation helpers
+# -------------------------------------------------------------------------
+
+def evaluate_prediction(S: np.ndarray, P: np.ndarray, gt: np.ndarray, alpha: float = 0.05) -> Dict[str, Any]:
+    """Return standard metrics comparing SMTE edges to ground truth."""
+    pred = (P < alpha).astype(int)
+    y_true = gt.flatten() > 0
+    y_pred = pred.flatten() > 0
+
+    acc = accuracy_score(y_true, y_pred)
+    prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
+    auc = roc_auc_score(y_true, (1 - P.flatten())) if (~np.isnan(P)).any() else 0.5
+    cm = confusion_matrix(y_true, y_pred)
+
+    return {
+        "accuracy": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "auc": auc,
+        "confusion_matrix": cm,
+    }
+
+
+def sweep_snr_test(
+    smte_obj: "SMTE",
+    n_roi: int = 6,
+    n_time: int = 400,
+    snr_grid: Tuple[float, ...] = (0.0, 3.0, 6.0, 10.0),
+    n_rep: int = 5,
+):
+    """Run Monte‑Carlo sweep over SNRs and print averaged metrics."""
+    causal = [(0, 1, 1, 0.8), (2, 3, 2, 0.6), (4, 5, 1, 0.7)]
+    for snr in snr_grid:
+        mets = []
+        for r in range(n_rep):
+            data, gt = generate_synthetic_data(n_roi, n_time, causal, snr_db=snr, seed=100 + r)
+            S, P, _ = smte_obj.smte_network(data)
+            mets.append(evaluate_prediction(S, P, gt, alpha=smte_obj.alpha))
+        # average metrics
+        keys = mets[0].keys()
+        avg = {k: np.mean([m[k] for m in mets]) for k in keys}
+        print(f"SNR={snr:>4} dB", {k: (float(v) if isinstance(v, np.generic) else v) for k, v in avg.items() if k != "confusion_matrix"})
