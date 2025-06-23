@@ -1,0 +1,14 @@
+Test_Category,Scenario,TR,Success,Confidence,Detections,Enhanced_Detection_Rate,Baseline_Detection_Rate,Improvement,Method,Auto_Confidence,Optimization_Benefit,Detection_Improvement
+Temporal_Resolution,High-res (0.5s),0.5,False,0.8735804647362989,5.0,,,,,,,
+Temporal_Resolution,Fast (1.0s),1.0,False,1.0,9.0,,,,,,,
+Temporal_Resolution,Standard (2.0s),2.0,False,0.6933612743506348,6.0,,,,,,,
+Temporal_Resolution,Clinical (3.0s),3.0,False,0.6933612743506348,8.0,,,,,,,
+Temporal_Resolution,Slow (4.0s),4.0,True,0.4641588833612779,10.0,,,,,,,
+Statistical_Power,"Strong signal, low noise",,,,,0.0,0.0,False,liberal_exploration,,,
+Statistical_Power,"Medium signal, medium noise",,,,,0.3333333333333333,0.0,True,liberal_exploration,,,
+Statistical_Power,"Weak signal, high noise",,,,,0.0,0.0,False,liberal_exploration,,,
+Statistical_Power,"Very weak signal, very high noise",,,,,0.0,0.0,False,liberal_exploration,,,
+Parameter_Optimization,"High-res, long scan",,,,,,,,,0.8735804647362989,True,True
+Parameter_Optimization,Standard fMRI,,,,,,,,,0.6933612743506348,False,True
+Parameter_Optimization,"Clinical, short scan",,,,,,,,,0.6933612743506348,False,True
+Parameter_Optimization,"Fast, very short scan",,,,,,,,,0.8879040017426006,True,True
