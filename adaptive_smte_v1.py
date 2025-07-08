@@ -188,7 +188,7 @@ class AdaptiveParameterOptimizer:
         
         return suggested
     
-    def optimize_parameters_grid_search(self, 
+    def optimize_parameters_grid_search(self,
                                       data: np.ndarray,
                                       ground_truth: Optional[np.ndarray] = None,
                                       sample_fraction: float = 0.3,
@@ -281,6 +281,88 @@ class AdaptiveParameterOptimizer:
         print(f"Best parameters found: {best_params} (score: {best_score:.3f})")
         
         return optimization_result
+
+    def optimize_parameters_cross_validation(self,
+                                             data: np.ndarray,
+                                             ground_truth: Optional[np.ndarray] = None,
+                                             cv_folds: int = 3,
+                                             quick_mode: bool = True) -> Dict[str, Any]:
+        """Optimize parameters using simple cross-validation."""
+
+        print(f"Optimizing parameters using cross-validation (folds={cv_folds}, quick_mode={quick_mode})...")
+
+        n_timepoints = data.shape[1]
+        fold_size = max(10, n_timepoints // cv_folds)
+
+        param_space = self.quick_space if quick_mode else self.parameter_space
+        param_names = list(param_space.keys())
+        param_values = list(param_space.values())
+        param_combinations = list(itertools.product(*param_values))
+
+        best_params = None
+        best_score = -np.inf
+        results = []
+
+        for i, param_combo in enumerate(param_combinations):
+            params = dict(zip(param_names, param_combo))
+            if 'ordinal_order' in params:
+                params['n_symbols'] = math.factorial(params['ordinal_order'])
+
+            print(f"  Testing {i+1}/{len(param_combinations)}: {params}")
+
+            fold_scores = []
+
+            for fold in range(cv_folds):
+                start = fold * fold_size
+                end = min(n_timepoints, start + fold_size)
+                if end - start < params.get('max_lag', 5) + 5:
+                    continue
+                fold_data = data[:, start:end]
+                if ground_truth is not None:
+                    fold_gt = ground_truth
+                else:
+                    fold_gt = None
+
+                try:
+                    smte = VoxelSMTEConnectivity(
+                        n_symbols=params.get('n_symbols', 6),
+                        symbolizer='ordinal',
+                        ordinal_order=params.get('ordinal_order', 3),
+                        max_lag=params.get('max_lag', 5),
+                        alpha=params.get('alpha', 0.05),
+                        n_permutations=30,
+                        random_state=self.random_state
+                    )
+
+                    symbolic_data = smte.symbolize_timeseries(fold_data)
+                    smte.symbolic_data = symbolic_data
+                    connectivity_matrix, _ = smte.compute_voxel_connectivity_matrix()
+                    score = self._evaluate_parameter_performance(connectivity_matrix, fold_gt, fold_data)
+                    fold_scores.append(score)
+                except Exception as e:
+                    print(f"    Fold {fold+1} failed: {e}")
+
+            if fold_scores:
+                avg_score = float(np.mean(fold_scores))
+            else:
+                avg_score = -np.inf
+
+            results.append({'params': params.copy(), 'score': avg_score})
+
+            if avg_score > best_score:
+                best_score = avg_score
+                best_params = params.copy()
+
+        optimization_result = {
+            'best_params': best_params,
+            'best_score': best_score,
+            'all_results': results,
+            'n_combinations_tested': len(param_combinations)
+        }
+
+        print(f"Best parameters found: {best_params} (score: {best_score:.3f})")
+
+        return optimization_result
     
     def _evaluate_parameter_performance(self, 
                                       connectivity_matrix: np.ndarray,
@@ -334,7 +416,7 @@ class AdaptiveSMTE(VoxelSMTEConnectivity):
     """
     
     def __init__(self, 
-                 adaptive_mode: str = 'heuristic',  # 'heuristic', 'grid_search', 'hybrid'
+                 adaptive_mode: str = 'heuristic',  # 'heuristic', 'grid_search', 'cross_validation', 'hybrid'
                  optimization_sample_fraction: float = 0.3,
                  quick_optimization: bool = True,
                  **kwargs):
@@ -403,6 +485,16 @@ class AdaptiveSMTE(VoxelSMTEConnectivity):
             optimization_result['method'] = 'grid_search'
             suggested_params = optimization_result['best_params']
             
+        elif self.adaptive_mode == 'cross_validation':
+            optimization_result = self.optimizer.optimize_parameters_cross_validation(
+                data,
+                ground_truth,
+                cv_folds=3,
+                quick_mode=self.quick_optimization
+            )
+            optimization_result['method'] = 'cross_validation'
+            suggested_params = optimization_result['best_params']
+
         elif self.adaptive_mode == 'hybrid':
             # Combine heuristic and grid search
             heuristic_params = self.optimizer.suggest_parameters_heuristic(data_characteristics)
@@ -495,7 +587,7 @@ def test_adaptive_smte():
     data = scaler.fit_transform(data.T).T
     
     # Test different adaptive modes
-    modes = ['heuristic', 'grid_search']
+    modes = ['heuristic', 'grid_search', 'cross_validation']
     
     for mode in modes:
         print(f"\nTesting {mode} mode...")
